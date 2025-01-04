@@ -1,0 +1,14 @@
+[package]
+name = "radix_sort"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+
+[dev-dependencies]
+criterion = "0.5.1"
+rand = "0.8"
+
+[[bench]]
+name = "bench_sort"
+harness = false
