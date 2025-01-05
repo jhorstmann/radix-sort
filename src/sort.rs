@@ -61,6 +61,62 @@ fn fill_histogram_multipass<T: TotalOrder>(
     already_sorted
 }
 
+#[inline(never)]
+fn fill_histogram_multipass_avx512<T: TotalOrder>(
+    values: &[T],
+    histogram: &mut [[u32; RADIX_HIST_LEN]; HIST_PER_U64],
+) -> [bool; HIST_PER_U64] {
+    assert!(HIST_PER_U64 <= 8);
+
+    for h in histogram.iter_mut() {
+        h.fill(0);
+    }
+
+    let mut last_bucket = [0_u32; HIST_PER_U64];
+    unsafe {
+        let histogram = histogram.as_flattened_mut();
+
+        let mut last_bucket_reg = _mm256_setzero_si256();
+        let iota = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+        let hist_per_u64_mask = ((1 << HIST_PER_U64) - 1) as __mmask8;
+        let offset = _mm256_mullo_epi32(iota, _mm256_set1_epi32(RADIX_HIST_LEN as _));
+        let shift = _mm512_cvtepi32_epi64(_mm256_mullo_epi32(iota, _mm256_set1_epi32(RADIX_BITS as _)));
+
+        values.iter().for_each(|v| {
+            let ord = v.to_total_order();
+
+            let buckets = _mm512_and_epi64(
+                _mm512_srlv_epi64(_mm512_set1_epi64(ord as i64), shift),
+                _mm512_set1_epi64(RADIX_HIST_LEN as i64 - 1),
+            );
+            let buckets = _mm512_cvtepi64_epi32(buckets);
+            let offsets = _mm256_add_epi32(offset, buckets);
+
+            let count = _mm256_mmask_i32gather_epi32::<4>(
+                _mm256_setzero_si256(),
+                hist_per_u64_mask,
+                offsets,
+                histogram.as_ptr() as *const _,
+            );
+            let new_count = _mm256_add_epi32(count, _mm256_set1_epi32(1));
+            _mm256_mask_i32scatter_epi32::<4>(histogram.as_mut_ptr() as *mut _, hist_per_u64_mask, offsets, new_count);
+
+            last_bucket_reg = buckets;
+        });
+
+        _mm256_storeu_epi32(last_bucket.as_mut_ptr() as *mut i32, last_bucket_reg);
+    }
+
+    let mut already_sorted = [false; HIST_PER_U64];
+    for i in 0..HIST_PER_U64 {
+        // mask again to avoid bounds check
+        let bucket = last_bucket[i] as usize & (RADIX_HIST_LEN - 1);
+        // if every item is in the same bucket then no sorting is necessary
+        already_sorted[i] = histogram[i][bucket] as usize == values.len();
+    }
+    already_sorted
+}
+
 #[inline(always)]
 unsafe fn total_order_buckets<const MASKED: bool, T: TotalOrderAvx512>(
     values: &[T],
@@ -98,7 +154,10 @@ unsafe fn histogram_avx512_step<const MASKED: bool, T: TotalOrderAvx512>(
 
     let zero = _mm256_set1_epi32(0);
     let one = _mm256_set1_epi32(1);
-    let offsets = _mm256_mullo_epi32(_mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7), _mm256_set1_epi32(RADIX_HIST_LEN as _));
+    let offsets = _mm256_mullo_epi32(
+        _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7),
+        _mm256_set1_epi32(RADIX_HIST_LEN as _),
+    );
 
     let (_, buckets, mask) = total_order_buckets::<MASKED, T>(values, shift, i);
 
@@ -107,7 +166,12 @@ unsafe fn histogram_avx512_step<const MASKED: bool, T: TotalOrderAvx512>(
     if cfg!(debug_assertions) {
         let indices = std::mem::transmute::<_, [u32; 8]>(indices);
         for i in indices {
-            assert!((i as usize) < histogram.len(), "index out of bounds {}, {}", i, histogram.len());
+            assert!(
+                (i as usize) < histogram.len(),
+                "index out of bounds {}, {}",
+                i,
+                histogram.len()
+            );
         }
     }
 
@@ -203,15 +267,17 @@ pub fn sort_slice_radix<T: TotalOrder + Default + Clone + Copy>(values: &[T]) ->
     let len = values.len();
     let mut values: Vec<T> = values.to_owned();
     let mut output: Vec<T> = vec![T::default(); len];
-    let mut histogram = [0_u32; RADIX_HIST_LEN];
+    let mut histogram = [[0_u32; RADIX_HIST_LEN]; HIST_PER_U64];
+
+    let all_values_equal = fill_histogram_multipass(&values, &mut histogram);
 
     for i in 0..HIST_PER_U64 {
-        let shift = i * RADIX_BITS;
-        let all_values_equal = fill_histogram(&values, shift, &mut histogram);
-        if !all_values_equal {
-            cumulative_histogram(&mut histogram);
+        if !all_values_equal[i] {
+            let shift = i * RADIX_BITS;
+            let histogram = &mut histogram[i];
+            cumulative_histogram(histogram);
 
-            reorder_values(&values, &mut output, &mut histogram, shift);
+            reorder_values(&values, &mut output, histogram, shift);
 
             std::mem::swap(&mut values, &mut output);
         }
@@ -272,13 +338,15 @@ pub fn sort_slice_radix_avx512<T: TotalOrder + TotalOrderAvx512 + Copy + Default
     let len = values.len();
     let mut values: Vec<T> = values.to_vec();
     let mut output: Vec<T> = vec![T::default(); len];
-    let mut histogram = [[0_u32; RADIX_HIST_LEN]; 8];
+    let mut histogram = [[0_u32; RADIX_HIST_LEN]; HIST_PER_U64];
+
+    let all_values_equal = fill_histogram_multipass_avx512(&values, &mut histogram);
 
     for i in 0..HIST_PER_U64 {
-        let shift = i * RADIX_BITS;
-        let all_values_equal = fill_histogram_avx512(&values, &mut histogram, shift);
-        if !all_values_equal {
-            let histogram = &mut histogram[0];
+        if !all_values_equal[i] {
+            let shift = i * RADIX_BITS;
+            let histogram = &mut histogram[i];
+
             cumulative_histogram(histogram);
 
             unsafe {
