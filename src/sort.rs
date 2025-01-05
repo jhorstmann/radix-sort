@@ -5,6 +5,7 @@
 // See https://travisdowns.github.io/blog/2019/05/22/sorting.html
 
 use crate::{TotalOrder, TotalOrderAvx512, HIST_PER_U64, RADIX_BITS, RADIX_HIST_LEN};
+use std::arch::x86_64::*;
 
 /// Fill the histogram for a digit indicated by the given `shift` amount.
 ///
@@ -61,14 +62,11 @@ fn fill_histogram_multipass<T: TotalOrder>(
 }
 
 #[inline(always)]
-unsafe fn histogram_avx512_step<const MASKED: bool, T: TotalOrderAvx512>(
+unsafe fn total_order_buckets<const MASKED: bool, T: TotalOrderAvx512>(
     values: &[T],
-    histogram: &mut [u32; RADIX_HIST_LEN],
     shift: usize,
     i: usize,
-) {
-    use std::arch::x86_64::*;
-
+) -> (__m512i, __m256i, __mmask8) {
     debug_assert!(i < values.len());
 
     let (v, mask) = if MASKED {
@@ -80,13 +78,26 @@ unsafe fn histogram_avx512_step<const MASKED: bool, T: TotalOrderAvx512>(
         (_mm512_loadu_si512(values.as_ptr().add(i) as *const _), 0xFF)
     };
 
-    let zero = _mm256_set1_epi32(0);
-    let one = _mm256_set1_epi32(1);
     let digit_mask = _mm512_set1_epi64((RADIX_HIST_LEN as u64 - 1) as i64);
     let digit_shift = _mm512_set1_epi64(shift as i64);
 
     let order = T::to_total_order_avx512(v);
     let buckets = _mm512_cvtepi64_epi32(_mm512_and_epi64(_mm512_srlv_epi64(order, digit_shift), digit_mask));
+
+    (v, buckets, mask)
+}
+
+#[inline(always)]
+unsafe fn histogram_avx512_step<const MASKED: bool, T: TotalOrderAvx512>(
+    values: &[T],
+    histogram: &mut [u32; RADIX_HIST_LEN],
+    shift: usize,
+    i: usize,
+) {
+    let zero = _mm256_set1_epi32(0);
+    let one = _mm256_set1_epi32(1);
+
+    let (_, buckets, mask) = total_order_buckets::<MASKED, T>(values, shift, i);
 
     // this relies on the fact that scatter is documented to write lanes in order, overwriting with the highest count
     let conflicts = _mm256_conflict_epi32(buckets);
@@ -177,8 +188,8 @@ pub fn sort_slice_radix<T: TotalOrder + Default + Clone + Copy>(values: &[T]) ->
 
     for i in 0..HIST_PER_U64 {
         let shift = i * RADIX_BITS;
-        let already_sorted = fill_histogram(&values, shift, &mut histogram);
-        if !already_sorted {
+        let all_values_equal = fill_histogram(&values, shift, &mut histogram);
+        if !all_values_equal {
             cumulative_histogram(&mut histogram);
 
             reorder_values(&values, &mut output, &mut histogram, shift);
@@ -192,9 +203,7 @@ pub fn sort_slice_radix<T: TotalOrder + Default + Clone + Copy>(values: &[T]) ->
 
 #[cfg(not(target_feature = "avx512vpopcntdq"))]
 #[inline(always)]
-pub(crate) unsafe fn popcount_epi32_lo8(conflicts: std::arch::x86_64::__m256i) -> std::arch::x86_64::__m256i {
-    use std::arch::x86_64::*;
-
+pub(crate) unsafe fn popcount_epi32_lo8(conflicts: __m256i) -> __m256i {
     let table = _mm_set_epi8(4, 3, 3, 2, 3, 2, 2, 1, 3, 2, 2, 1, 2, 1, 1, 0);
     let table = _mm256_set_m128i(table, table);
 
@@ -211,31 +220,12 @@ unsafe fn radix_avx512_reorder_step<const MASKED: bool, T: TotalOrder + TotalOrd
     shift: usize,
     i: usize,
 ) {
-    use std::arch::x86_64::*;
-
     debug_assert!(values.len() == output.len());
-    debug_assert!(i < values.len());
-
-    let len = values.len();
-
-    let mask = if MASKED {
-        debug_assert!(len - i < 8);
-        (1 << (len - i)) - 1
-    } else {
-        debug_assert!(i + 8 <= len);
-        0xFF
-    };
 
     let zero = _mm256_set1_epi32(0);
     let one = _mm256_set1_epi32(1);
 
-    let values = _mm512_maskz_loadu_epi64(mask, values.as_ptr().add(i) as *const _);
-    let ordered = T::to_total_order_avx512(values);
-    let buckets = _mm512_and_epi64(
-        _mm512_srlv_epi64(ordered, _mm512_set1_epi64(shift as i64)),
-        _mm512_set1_epi64(RADIX_HIST_LEN as i64 - 1),
-    );
-    let buckets = _mm512_cvtepi64_epi32(buckets);
+    let (values, buckets, mask) = total_order_buckets::<MASKED, T>(values, shift, i);
 
     let output_indices = _mm256_mmask_i32gather_epi32::<4>(zero, mask, buckets, histogram.as_ptr() as *const _);
     let conflicts = _mm256_mask_conflict_epi32(zero, mask, output_indices);
@@ -259,9 +249,7 @@ unsafe fn radix_avx512_reorder_step<const MASKED: bool, T: TotalOrder + TotalOrd
 }
 
 #[inline(never)]
-pub fn sort_slice_radix_avx512<T: TotalOrder + crate::total_order::TotalOrderAvx512 + Copy + Default>(
-    values: &[T],
-) -> Vec<T> {
+pub fn sort_slice_radix_avx512<T: TotalOrder + TotalOrderAvx512 + Copy + Default>(values: &[T]) -> Vec<T> {
     let len = values.len();
     let mut values: Vec<T> = values.to_vec();
     let mut output: Vec<T> = vec![T::default(); len];
@@ -269,8 +257,8 @@ pub fn sort_slice_radix_avx512<T: TotalOrder + crate::total_order::TotalOrderAvx
 
     for i in 0..HIST_PER_U64 {
         let shift = i * RADIX_BITS;
-        let already_sorted = fill_histogram_avx512_popcnt(&values, &mut histogram, shift);
-        if !already_sorted {
+        let all_values_equal = fill_histogram_avx512_popcnt(&values, &mut histogram, shift);
+        if !all_values_equal {
             cumulative_histogram(&mut histogram);
 
             unsafe {
