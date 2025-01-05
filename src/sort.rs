@@ -90,30 +90,47 @@ unsafe fn total_order_buckets<const MASKED: bool, T: TotalOrderAvx512>(
 #[inline(always)]
 unsafe fn histogram_avx512_step<const MASKED: bool, T: TotalOrderAvx512>(
     values: &[T],
-    histogram: &mut [u32; RADIX_HIST_LEN],
+    histogram: &mut [[u32; RADIX_HIST_LEN]; 8],
     shift: usize,
     i: usize,
 ) {
+    let histogram = histogram.as_flattened_mut();
+
     let zero = _mm256_set1_epi32(0);
     let one = _mm256_set1_epi32(1);
+    let offsets = _mm256_mullo_epi32(_mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7), _mm256_set1_epi32(RADIX_HIST_LEN as _));
 
     let (_, buckets, mask) = total_order_buckets::<MASKED, T>(values, shift, i);
 
-    // this relies on the fact that scatter is documented to write lanes in order, overwriting with the highest count
-    let conflicts = _mm256_conflict_epi32(buckets);
-    let increments = _mm256_add_epi32(_mm256_popcnt_epi32(conflicts), one);
-    let old = _mm256_mmask_i32gather_epi32::<4>(zero, mask, buckets, histogram.as_ptr() as *const u8);
-    let new = _mm256_add_epi32(old, increments);
-    _mm256_mask_i32scatter_epi32::<4>(histogram.as_mut_ptr() as *mut u8, mask, buckets, new)
+    let indices = _mm256_add_epi32(buckets, offsets);
+
+    if cfg!(debug_assertions) {
+        let indices = std::mem::transmute::<_, [u32; 8]>(indices);
+        for i in indices {
+            assert!((i as usize) < histogram.len(), "index out of bounds {}, {}", i, histogram.len());
+        }
+    }
+
+    let old = _mm256_mmask_i32gather_epi32::<4>(zero, mask, indices, histogram.as_ptr() as *const u8);
+    let new = _mm256_add_epi32(old, one);
+    _mm256_mask_i32scatter_epi32::<4>(histogram.as_mut_ptr() as *mut u8, mask, indices, new)
+}
+
+#[inline(always)]
+fn histogram_avx512_final(histogram: &mut [[u32; RADIX_HIST_LEN]; 8]) {
+    let (first, rest) = histogram.split_first_mut().unwrap();
+    rest.iter().for_each(|h| {
+        first.iter_mut().zip(h).for_each(|(a, b)| *a += *b);
+    })
 }
 
 #[inline(never)]
-fn fill_histogram_avx512_popcnt<T: TotalOrderAvx512>(
+fn fill_histogram_avx512<T: TotalOrderAvx512>(
     values: &[T],
-    histogram: &mut [u32; RADIX_HIST_LEN],
+    histogram: &mut [[u32; RADIX_HIST_LEN]; 8],
     shift: usize,
 ) -> bool {
-    histogram.fill(0);
+    histogram.iter_mut().for_each(|h| h.fill(0));
 
     let mut i = 0;
 
@@ -137,8 +154,10 @@ fn fill_histogram_avx512_popcnt<T: TotalOrderAvx512>(
         }
     }
 
+    histogram_avx512_final(histogram);
+
     // if every item is in the same bucket then no sorting is necessary
-    histogram.iter().any(|c| *c as usize == values.len())
+    histogram[0].iter().any(|c| *c as usize == values.len())
 }
 
 /// Calculate the prefix sum of the histogram, resulting in the starting indices to the output for each bucket.
@@ -253,29 +272,30 @@ pub fn sort_slice_radix_avx512<T: TotalOrder + TotalOrderAvx512 + Copy + Default
     let len = values.len();
     let mut values: Vec<T> = values.to_vec();
     let mut output: Vec<T> = vec![T::default(); len];
-    let mut histogram = [0_u32; RADIX_HIST_LEN];
+    let mut histogram = [[0_u32; RADIX_HIST_LEN]; 8];
 
     for i in 0..HIST_PER_U64 {
         let shift = i * RADIX_BITS;
-        let all_values_equal = fill_histogram_avx512_popcnt(&values, &mut histogram, shift);
+        let all_values_equal = fill_histogram_avx512(&values, &mut histogram, shift);
         if !all_values_equal {
-            cumulative_histogram(&mut histogram);
+            let histogram = &mut histogram[0];
+            cumulative_histogram(histogram);
 
             unsafe {
                 let mut i = 0;
 
                 while i + 16 <= len {
-                    radix_avx512_reorder_step::<false, _>(&values, &mut output, &mut histogram, shift, i);
+                    radix_avx512_reorder_step::<false, _>(&values, &mut output, histogram, shift, i);
                     i += 8;
-                    radix_avx512_reorder_step::<false, _>(&values, &mut output, &mut histogram, shift, i);
+                    radix_avx512_reorder_step::<false, _>(&values, &mut output, histogram, shift, i);
                     i += 8;
                 }
                 while i + 8 <= len {
-                    radix_avx512_reorder_step::<false, _>(&values, &mut output, &mut histogram, shift, i);
+                    radix_avx512_reorder_step::<false, _>(&values, &mut output, histogram, shift, i);
                     i += 8;
                 }
                 if i < len {
-                    radix_avx512_reorder_step::<true, _>(&values, &mut output, &mut histogram, shift, i);
+                    radix_avx512_reorder_step::<true, _>(&values, &mut output, histogram, shift, i);
                 }
             }
             std::mem::swap(&mut values, &mut output);
@@ -287,33 +307,33 @@ pub fn sort_slice_radix_avx512<T: TotalOrder + TotalOrderAvx512 + Copy + Default
 
 #[cfg(test)]
 mod tests {
-    use crate::sort::fill_histogram_avx512_popcnt;
+    use crate::sort::fill_histogram_avx512;
     use crate::RADIX_HIST_LEN;
 
     #[test]
     fn test_histogram_avx512_distinct() {
-        let mut histogram = [0_u32; RADIX_HIST_LEN];
+        let mut histogram = [[0_u32; RADIX_HIST_LEN]; 8];
         let values = [1, 2, 3, 4, 5];
-        let all_same = fill_histogram_avx512_popcnt(&values, &mut histogram, 0);
+        let all_same = fill_histogram_avx512(&values, &mut histogram, 0);
         assert!(!all_same);
-        assert_eq!(&histogram[0..6], &[0, 1, 1, 1, 1, 1]);
+        assert_eq!(&histogram[0][0..6], &[0, 1, 1, 1, 1, 1]);
     }
 
     #[test]
     fn test_histogram_avx512_repeated() {
-        let mut histogram = [0_u32; RADIX_HIST_LEN];
+        let mut histogram = [[0_u32; RADIX_HIST_LEN]; 8];
         let values = [1, 1, 2, 2, 3];
-        let all_same = fill_histogram_avx512_popcnt(&values, &mut histogram, 0);
+        let all_same = fill_histogram_avx512(&values, &mut histogram, 0);
         assert!(!all_same);
-        assert_eq!(&histogram[0..4], &[0, 2, 2, 1]);
+        assert_eq!(&histogram[0][0..4], &[0, 2, 2, 1]);
     }
 
     #[test]
     fn test_histogram_avx512_shifted() {
-        let mut histogram = [0_u32; RADIX_HIST_LEN];
+        let mut histogram = [[0_u32; RADIX_HIST_LEN]; 8];
         let values = [1 << 13, 1 << 13, 2 << 13, 2 << 13, 3 << 13];
-        let all_same = fill_histogram_avx512_popcnt(&values, &mut histogram, 13);
+        let all_same = fill_histogram_avx512(&values, &mut histogram, 13);
         assert!(!all_same);
-        assert_eq!(&histogram[0..4], &[0, 2, 2, 1]);
+        assert_eq!(&histogram[0][0..4], &[0, 2, 2, 1]);
     }
 }
