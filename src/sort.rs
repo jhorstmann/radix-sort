@@ -4,7 +4,7 @@
 // http://stereopsis.com/radix.html
 // See https://travisdowns.github.io/blog/2019/05/22/sorting.html
 
-use crate::{TotalOrder, TotalOrderAvx512, HIST_PER_U64, RADIX_BITS, RADIX_HIST_LEN};
+use crate::{ToBits, TotalOrder, TotalOrderAvx512, HIST_PER_U64, RADIX_BITS, RADIX_HIST_LEN};
 use std::arch::x86_64::*;
 
 /// Fill the histogram for a digit indicated by the given `shift` amount.
@@ -62,7 +62,7 @@ fn fill_histogram_multipass<T: TotalOrder>(
 }
 
 #[inline(never)]
-fn fill_histogram_multipass_avx512<T: TotalOrder>(
+fn fill_histogram_multipass_avx512<T: ToBits + TotalOrderAvx512>(
     values: &[T],
     histogram: &mut [[u32; RADIX_HIST_LEN]; HIST_PER_U64],
 ) -> [bool; HIST_PER_U64] {
@@ -83,10 +83,10 @@ fn fill_histogram_multipass_avx512<T: TotalOrder>(
         let shift = _mm512_cvtepi32_epi64(_mm256_mullo_epi32(iota, _mm256_set1_epi32(RADIX_BITS as _)));
 
         values.iter().for_each(|v| {
-            let ord = v.to_total_order();
+            let ord = T::to_total_order_avx512(_mm512_set1_epi64(v.to_bits() as i64));
 
             let buckets = _mm512_and_epi64(
-                _mm512_srlv_epi64(_mm512_set1_epi64(ord as i64), shift),
+                _mm512_srlv_epi64(ord, shift),
                 _mm512_set1_epi64(RADIX_HIST_LEN as i64 - 1),
             );
             let buckets = _mm512_cvtepi64_epi32(buckets);
@@ -334,7 +334,7 @@ unsafe fn radix_avx512_reorder_step<const MASKED: bool, T: TotalOrder + TotalOrd
 }
 
 #[inline(never)]
-pub fn sort_slice_radix_avx512<T: TotalOrder + TotalOrderAvx512 + Copy + Default>(values: &[T]) -> Vec<T> {
+pub fn sort_slice_radix_avx512<T: TotalOrder + TotalOrderAvx512 + ToBits + Copy + Default>(values: &[T]) -> Vec<T> {
     let len = values.len();
     let mut values: Vec<T> = values.to_vec();
     let mut output: Vec<T> = vec![T::default(); len];
