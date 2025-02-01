@@ -11,4 +11,5 @@ pub use total_order::*;
 // 16 -> 4 passes per u64, 0.5m memory, should be even worse
 pub(crate) const RADIX_BITS: usize = 11;
 pub(crate) const RADIX_HIST_LEN: usize = 1 << RADIX_BITS;
+pub(crate) const RADIX_HIST_MASK: u64 = (RADIX_HIST_LEN - 1) as u64;
 pub(crate) const HIST_PER_U64: usize = 64_usize.div_ceil(RADIX_BITS);

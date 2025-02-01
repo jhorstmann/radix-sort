@@ -4,7 +4,7 @@
 // http://stereopsis.com/radix.html
 // See https://travisdowns.github.io/blog/2019/05/22/sorting.html
 
-use crate::{ToBits, TotalOrder, TotalOrderAvx512, HIST_PER_U64, RADIX_BITS, RADIX_HIST_LEN};
+use crate::{ToBits, TotalOrder, TotalOrderAvx512, HIST_PER_U64, RADIX_BITS, RADIX_HIST_LEN, RADIX_HIST_MASK};
 use std::arch::x86_64::*;
 
 /// Fill the histogram for a digit indicated by the given `shift` amount.
@@ -14,15 +14,15 @@ use std::arch::x86_64::*;
 fn fill_histogram<T: TotalOrder>(values: &[T], shift: usize, histogram: &mut [u32; RADIX_HIST_LEN]) -> bool {
     histogram.fill(0);
 
-    let mut last_bucket = 0;
+    let mut last_bucket = 0_usize;
     values.iter().for_each(|v| {
-        let bucket = (v.to_total_order() >> shift) & (RADIX_HIST_LEN as u64 - 1);
-        histogram[bucket as usize] += 1;
+        let bucket = ((v.to_total_order() >> shift) & RADIX_HIST_MASK) as usize;
+        histogram[bucket] += 1;
         last_bucket = bucket;
     });
 
     // if every item is in the same bucket then no sorting is necessary
-    histogram[last_bucket as usize] as usize == values.len()
+    histogram[last_bucket] as usize == values.len()
 }
 
 /// Fill multiple histograms, one for each digit of the input `values`.
@@ -33,9 +33,7 @@ fn fill_histogram_multipass<T: TotalOrder>(
     values: &[T],
     histogram: &mut [[u32; RADIX_HIST_LEN]; HIST_PER_U64],
 ) -> [bool; HIST_PER_U64] {
-    for h in histogram.iter_mut() {
-        h.fill(0);
-    }
+    histogram.as_flattened_mut().fill(0);
 
     // should be const but that gives error that outer generic parameter can not be referenced
     let digits: usize = (size_of::<T>() * 8).div_ceil(RADIX_BITS);
@@ -45,7 +43,7 @@ fn fill_histogram_multipass<T: TotalOrder>(
         let ord = v.to_total_order();
         for i in 0..digits {
             let shift = i * RADIX_BITS;
-            let bucket = (ord >> shift) & (RADIX_HIST_LEN as u64 - 1);
+            let bucket = (ord >> shift) & RADIX_HIST_MASK;
             histogram[i][bucket as usize] += 1;
             last_bucket[i] = bucket;
         }
@@ -54,7 +52,7 @@ fn fill_histogram_multipass<T: TotalOrder>(
     let mut already_sorted = [false; HIST_PER_U64];
     for i in 0..HIST_PER_U64 {
         // mask again to avoid bounds check
-        let bucket = last_bucket[i] as usize & (RADIX_HIST_LEN - 1);
+        let bucket = (last_bucket[i] & RADIX_HIST_MASK) as usize;
         // if every item is in the same bucket then no sorting is necessary
         already_sorted[i] = histogram[i][bucket] as usize == values.len();
     }
@@ -68,9 +66,7 @@ fn fill_histogram_multipass_avx512<T: ToBits + TotalOrderAvx512>(
 ) -> [bool; HIST_PER_U64] {
     assert!(HIST_PER_U64 <= 8);
 
-    for h in histogram.iter_mut() {
-        h.fill(0);
-    }
+    histogram.as_flattened_mut().fill(0);
 
     let mut last_bucket = [0_u32; HIST_PER_U64];
     unsafe {
@@ -81,15 +77,12 @@ fn fill_histogram_multipass_avx512<T: ToBits + TotalOrderAvx512>(
         let hist_per_u64_mask = ((1 << HIST_PER_U64) - 1) as __mmask8;
         let offset = _mm256_mullo_epi32(iota, _mm256_set1_epi32(RADIX_HIST_LEN as _));
         let shift = _mm512_cvtepi32_epi64(_mm256_mullo_epi32(iota, _mm256_set1_epi32(RADIX_BITS as _)));
+        let mask = _mm512_set1_epi64(RADIX_HIST_MASK as _);
 
         values.iter().for_each(|v| {
             let ord = T::to_total_order_avx512(_mm512_set1_epi64(v.to_bits() as i64));
 
-            let buckets = _mm512_and_epi64(
-                _mm512_srlv_epi64(ord, shift),
-                _mm512_set1_epi64(RADIX_HIST_LEN as i64 - 1),
-            );
-            let buckets = _mm512_cvtepi64_epi32(buckets);
+            let buckets = _mm512_cvtepi64_epi32(_mm512_and_epi64(_mm512_srlv_epi64(ord, shift), mask));
             let offsets = _mm256_add_epi32(offset, buckets);
 
             let count = _mm256_mmask_i32gather_epi32::<4>(
@@ -134,7 +127,7 @@ unsafe fn total_order_buckets<const MASKED: bool, T: TotalOrderAvx512>(
         (_mm512_loadu_si512(values.as_ptr().add(i) as *const _), 0xFF)
     };
 
-    let digit_mask = _mm512_set1_epi64((RADIX_HIST_LEN as u64 - 1) as i64);
+    let digit_mask = _mm512_set1_epi64(RADIX_HIST_MASK as i64);
     let digit_shift = _mm512_set1_epi64(shift as i64);
 
     let order = T::to_total_order_avx512(v);
@@ -246,7 +239,7 @@ fn reorder_values<T: TotalOrder + Copy>(
     let remainder = chunks.remainder();
     chunks.into_iter().for_each(|chunk| {
         chunk.iter().for_each(|value| {
-            let bucket = (value.to_total_order() >> shift) & (RADIX_HIST_LEN as u64 - 1);
+            let bucket = (value.to_total_order() >> shift) & RADIX_HIST_MASK;
             let output_idx = histogram[bucket as usize];
             unsafe { *output.get_unchecked_mut(output_idx as usize) = *value };
             let next_output_idx = output_idx + 1;
@@ -254,7 +247,7 @@ fn reorder_values<T: TotalOrder + Copy>(
         });
     });
     remainder.iter().for_each(|value| {
-        let bucket = (value.to_total_order() >> shift) & (RADIX_HIST_LEN as u64 - 1);
+        let bucket = (value.to_total_order() >> shift) & RADIX_HIST_MASK;
         let output_idx = histogram[bucket as usize];
         unsafe { *output.get_unchecked_mut(output_idx as usize) = *value };
         let next_output_idx = output_idx + 1;
@@ -286,6 +279,7 @@ pub fn sort_slice_radix<T: TotalOrder + Default + Clone + Copy>(values: &[T]) ->
     values
 }
 
+/// For each packed 32-bit integer maps the value to the number of logical 1 bits in the least significant byte.
 #[cfg(not(target_feature = "avx512vpopcntdq"))]
 #[inline(always)]
 pub(crate) unsafe fn popcount_epi32_lo8(conflicts: __m256i) -> __m256i {
