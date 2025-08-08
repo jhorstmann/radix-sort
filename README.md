@@ -1,6 +1,6 @@
 # Radix sort implementation using AVX-512
 
-This needs a nightly version of rustc in order to use avx512 intrinsics.
+This needs at least version 1.89 of rustc in order to use avx512 intrinsics on the stable channel.
 
 Run benchmarks using
 

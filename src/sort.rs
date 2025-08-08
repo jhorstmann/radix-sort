@@ -168,9 +168,9 @@ unsafe fn histogram_avx512_step<const MASKED: bool, T: TotalOrderAvx512>(
         }
     }
 
-    let old = _mm256_mmask_i32gather_epi32::<4>(zero, mask, indices, histogram.as_ptr() as *const u8);
+    let old = _mm256_mmask_i32gather_epi32::<4>(zero, mask, indices, histogram.as_ptr().cast());
     let new = _mm256_add_epi32(old, one);
-    _mm256_mask_i32scatter_epi32::<4>(histogram.as_mut_ptr() as *mut u8, mask, indices, new)
+    _mm256_mask_i32scatter_epi32::<4>(histogram.as_mut_ptr().cast(), mask, indices, new)
 }
 
 #[inline(always)]

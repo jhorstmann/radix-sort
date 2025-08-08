@@ -1,4 +1,3 @@
-#![feature(stdarch_x86_avx512)]
 mod sort;
 mod total_order;
 
